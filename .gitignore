@@ -1,0 +1,22 @@
+node_modules/
+dist/
+*.js.map
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.sln.docstates
+
+# Claude Code
+.claude/settings.local.json
