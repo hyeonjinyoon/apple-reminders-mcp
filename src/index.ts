@@ -26,14 +26,22 @@ function parseList(raw: string): string[] {
   return raw.split(", ").map((s) => s.trim()).filter(Boolean);
 }
 
-/** Parse AppleScript date string to ISO */
+/** Parse AppleScript date string to ISO.
+ *  Handles Korean locale format: "2026년 3월 22일 일요일 21:00:00"
+ *  and English locale format: "Sunday, March 22, 2026 at 9:00:00 PM" */
 function parseDate(raw: string): string | null {
   if (!raw || raw === "missing value") return null;
-  try {
-    return new Date(raw).toISOString();
-  } catch {
-    return raw; // return raw string if parsing fails
+  // Korean locale: "2026년 3월 22일 일요일 21:00:00"
+  const koMatch = raw.match(/(\d{4})년\s+(\d{1,2})월\s+(\d{1,2})일\s+\S+\s+(\d{1,2}):(\d{2}):(\d{2})/);
+  if (koMatch) {
+    const [, y, mo, d, h, mi, s] = koMatch;
+    return new Date(+y!, +mo! - 1, +d!, +h!, +mi!, +s!).toISOString();
   }
+  try {
+    const parsed = new Date(raw);
+    if (!isNaN(parsed.getTime())) return parsed.toISOString();
+  } catch { /* fall through */ }
+  return raw;
 }
 
 // ─── Tools ────────────────────────────────────────────────
@@ -106,67 +114,51 @@ Returns:
   },
   async ({ list_name, include_completed }) => {
     const escaped = escapeForAppleScript(list_name);
-    // Single-query approach to avoid comma-in-name parsing issues.
-    // Previously each property was fetched separately and joined by index,
-    // but AppleScript's comma-separated list output breaks when names contain commas.
-    const reminderSource = include_completed
+    // Batch-property approach: fetch each property as a list in a separate
+    // osascript call, then combine by index in JS.
+    // The `repeat` loop approach hangs on macOS 26 due to slow per-item
+    // Apple Event resolution. Batch `<prop> of every reminder` is fast.
+    // Custom delimiter "|||" avoids comma-in-name parsing issues.
+    const filter = include_completed
       ? `every reminder in list "${escaped}"`
       : `every reminder in list "${escaped}" whose completed is false`;
 
-    const script = `
-tell application "Reminders"
-  set output to ""
-  repeat with r in (${reminderSource})
-    set rName to name of r
-    set rId to id of r
-    set rDone to completed of r
-    try
-      set rDue to due date of r
-    on error
-      set rDue to "missing value"
-    end try
-    try
-      set rPri to priority of r
-    on error
-      set rPri to 0
-    end try
-    try
-      set rBody to body of r
-    on error
-      set rBody to "missing value"
-    end try
-    try
-      set rFlag to flagged of r
-    on error
-      set rFlag to false
-    end try
-    set output to output & rName & "\\t" & rId & "\\t" & rDone & "\\t" & rDue & "\\t" & rPri & "\\t" & rBody & "\\t" & rFlag & "\\n"
-  end repeat
-  return output
-end tell`;
+    const batchQuery = (prop: string) =>
+      `tell application "Reminders"\nset AppleScript's text item delimiters to "|||"\nreturn (${prop} of ${filter}) as text\nend tell`;
 
-    const raw = await runAppleScript(script);
-    if (!raw) {
+    const [namesRaw, idsRaw, datesRaw, prisRaw, bodiesRaw, flagsRaw] =
+      await Promise.all([
+        runAppleScript(batchQuery("name")),
+        runAppleScript(batchQuery("id")),
+        runAppleScript(batchQuery("due date")),
+        runAppleScript(batchQuery("priority")),
+        runAppleScript(batchQuery("body")),
+        runAppleScript(batchQuery("flagged")),
+      ]);
+
+    const sep = "|||";
+    const names = namesRaw ? namesRaw.split(sep) : [];
+    if (names.length === 0) {
       return {
         content: [{ type: "text", text: JSON.stringify([], null, 2) }],
       };
     }
 
-    const items = raw
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => {
-        const [name, id, completed, due_date, priority, body, flagged] = line.split("\t");
-        return {
-          name: name ?? "",
-          id: id ?? "",
-          completed: completed === "true",
-          due_date: parseDate(due_date ?? ""),
-          priority: parseInt(priority ?? "0", 10),
-          body: body === "missing value" ? null : (body ?? null),
-          flagged: flagged === "true",
-        };
-      });
+    const ids = idsRaw ? idsRaw.split(sep) : [];
+    const dates = datesRaw ? datesRaw.split(sep) : [];
+    const pris = prisRaw ? prisRaw.split(sep) : [];
+    const bodies = bodiesRaw ? bodiesRaw.split(sep) : [];
+    const flags = flagsRaw ? flagsRaw.split(sep) : [];
+
+    const items = names.map((name, i) => ({
+      name: name.trim(),
+      id: (ids[i] ?? "").trim(),
+      completed: include_completed ? undefined : false,
+      due_date: parseDate((dates[i] ?? "").trim()),
+      priority: parseInt((pris[i] ?? "0").trim(), 10),
+      body: (bodies[i] ?? "").trim() === "missing value" ? null : (bodies[i] ?? "").trim() || null,
+      flagged: (flags[i] ?? "").trim() === "true",
+    }));
 
     return {
       content: [{ type: "text", text: JSON.stringify(items, null, 2) }],
@@ -481,50 +473,54 @@ Returns:
     const queryEsc = escapeForAppleScript(query);
     const filter = include_completed ? "" : " and completed is false";
 
-    // JXA (JavaScript for Automation) is more flexible for searching
-    const script = `
-tell application "Reminders"
-  set output to ""
-  repeat with aList in every list
-    set listName to name of aList
-    repeat with r in (every reminder in aList whose name contains "${queryEsc}"${filter})
-      set rName to name of r
-      set rId to id of r
-      set rDone to completed of r
-      try
-        set rDue to due date of r
-      on error
-        set rDue to "missing value"
-      end try
-      set output to output & listName & "\\t" & rName & "\\t" & rId & "\\t" & rDone & "\\t" & rDue & "\\n"
-    end repeat
-  end repeat
-  return output
-end tell`;
+    // Get all list names first
+    const listNamesRaw = await runAppleScript(
+      'tell application "Reminders" to get name of every list'
+    );
+    const listNames = parseList(listNamesRaw);
 
-    const raw = await runAppleScript(script);
-    if (!raw) {
-      return {
-        content: [{ type: "text", text: JSON.stringify([], null, 2) }],
-      };
+    const allResults: { name: string; list_name: string; id: string; completed: boolean; due_date: string | null }[] = [];
+
+    // Search each list using batch property approach (no repeat loop)
+    for (const listName of listNames) {
+      const listEsc = escapeForAppleScript(listName);
+      const src = `every reminder in list "${listEsc}" whose name contains "${queryEsc}"${filter}`;
+      const sep = "|||";
+
+      try {
+        const namesRaw = await runAppleScript(
+          `tell application "Reminders"\nset AppleScript's text item delimiters to "${sep}"\nreturn (name of ${src}) as text\nend tell`
+        );
+        if (!namesRaw) continue;
+
+        const names = namesRaw.split(sep);
+        const [idsRaw, datesRaw, completedRaw] = await Promise.all([
+          runAppleScript(`tell application "Reminders"\nset AppleScript's text item delimiters to "${sep}"\nreturn (id of ${src}) as text\nend tell`),
+          runAppleScript(`tell application "Reminders"\nset AppleScript's text item delimiters to "${sep}"\nreturn (due date of ${src}) as text\nend tell`),
+          runAppleScript(`tell application "Reminders"\nset AppleScript's text item delimiters to "${sep}"\nreturn (completed of ${src}) as text\nend tell`),
+        ]);
+
+        const ids = idsRaw ? idsRaw.split(sep) : [];
+        const dates = datesRaw ? datesRaw.split(sep) : [];
+        const completed = completedRaw ? completedRaw.split(sep) : [];
+
+        for (let i = 0; i < names.length; i++) {
+          allResults.push({
+            name: names[i].trim(),
+            list_name: listName,
+            id: (ids[i] ?? "").trim(),
+            completed: (completed[i] ?? "").trim() === "true",
+            due_date: parseDate((dates[i] ?? "").trim()),
+          });
+        }
+      } catch {
+        // No matching reminders in this list — skip
+        continue;
+      }
     }
 
-    const results = raw
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => {
-        const [list_name, name, id, completed, due_date] = line.split("\t");
-        return {
-          name: name ?? "",
-          list_name: list_name ?? "",
-          id: id ?? "",
-          completed: completed === "true",
-          due_date: parseDate(due_date ?? ""),
-        };
-      });
-
     return {
-      content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
+      content: [{ type: "text", text: JSON.stringify(allResults, null, 2) }],
     };
   }
 );
