@@ -26,7 +26,20 @@ function parseList(raw: string): string[] {
   return raw.split(", ").map((s) => s.trim()).filter(Boolean);
 }
 
-/** Parse AppleScript date string to ISO.
+/** Format a Date as local ISO 8601 with timezone offset (e.g. "2026-04-01T00:00:00+09:00") */
+function toLocalISOString(date: Date): string {
+  const off = -date.getTimezoneOffset();
+  const sign = off >= 0 ? "+" : "-";
+  const abs = Math.abs(off);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}` +
+    `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`
+  );
+}
+
+/** Parse AppleScript date string to local ISO 8601 with timezone offset.
  *  Handles Korean locale format: "2026년 3월 22일 일요일 21:00:00"
  *  and English locale format: "Sunday, March 22, 2026 at 9:00:00 PM" */
 function parseDate(raw: string): string | null {
@@ -35,11 +48,11 @@ function parseDate(raw: string): string | null {
   const koMatch = raw.match(/(\d{4})년\s+(\d{1,2})월\s+(\d{1,2})일\s+\S+\s+(\d{1,2}):(\d{2}):(\d{2})/);
   if (koMatch) {
     const [, y, mo, d, h, mi, s] = koMatch;
-    return new Date(+y!, +mo! - 1, +d!, +h!, +mi!, +s!).toISOString();
+    return toLocalISOString(new Date(+y!, +mo! - 1, +d!, +h!, +mi!, +s!));
   }
   try {
     const parsed = new Date(raw);
-    if (!isNaN(parsed.getTime())) return parsed.toISOString();
+    if (!isNaN(parsed.getTime())) return toLocalISOString(parsed);
   } catch { /* fall through */ }
   return raw;
 }
