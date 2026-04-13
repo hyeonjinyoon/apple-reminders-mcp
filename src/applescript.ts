@@ -46,5 +46,10 @@ export async function runAppleScriptLines(lines: string[]): Promise<string> {
  * Escape a string for safe inclusion in AppleScript double-quoted strings.
  */
 export function escapeForAppleScript(str: string): string {
-  return str.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return str
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\t/g, "\\t");
 }

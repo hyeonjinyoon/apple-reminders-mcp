@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -112,7 +113,7 @@ Args:
 Returns:
   Array of { name, id, completed, due_date, priority, body, flagged }`,
     inputSchema: {
-      list_name: z.string().describe("Name of the reminder list"),
+      list_name: z.string().max(500).describe("Name of the reminder list"),
       include_completed: z
         .boolean()
         .default(false)
@@ -198,11 +199,12 @@ Args:
 Returns:
   { id, name, list_name }`,
     inputSchema: {
-      list_name: z.string().describe("Target reminder list name"),
-      name: z.string().min(1).describe("Reminder title"),
-      body: z.string().optional().describe("Reminder notes"),
+      list_name: z.string().max(500).describe("Target reminder list name"),
+      name: z.string().min(1).max(1000).describe("Reminder title"),
+      body: z.string().max(5000).optional().describe("Reminder notes"),
       due_date: z
         .string()
+        .max(100)
         .optional()
         .describe("Due date in ISO 8601 (e.g. 2025-03-15T09:00:00)"),
       priority: z
@@ -283,15 +285,16 @@ Returns:
 
     let script: string;
     if (due_date) {
+      const d = new Date(due_date);
       // AppleScript needs date conversion
       script = `
 tell application "Reminders"
   set dueDate to current date
-  set year of dueDate to ${new Date(due_date).getFullYear()}
-  set month of dueDate to ${new Date(due_date).getMonth() + 1}
-  set day of dueDate to ${new Date(due_date).getDate()}
-  set hours of dueDate to ${new Date(due_date).getHours()}
-  set minutes of dueDate to ${new Date(due_date).getMinutes()}
+  set year of dueDate to ${d.getFullYear()}
+  set month of dueDate to ${d.getMonth() + 1}
+  set day of dueDate to ${d.getDate()}
+  set hours of dueDate to ${d.getHours()}
+  set minutes of dueDate to ${d.getMinutes()}
   set seconds of dueDate to 0
   set newReminder to make new reminder in list "${listEsc}" with properties {${props.join(", ")}, due date:dueDate}
   return id of newReminder
@@ -327,8 +330,8 @@ Args:
 Returns:
   { success: boolean, name: string }`,
     inputSchema: {
-      list_name: z.string().describe("Reminder list name"),
-      reminder_name: z.string().describe("Name of the reminder to complete"),
+      list_name: z.string().max(500).describe("Reminder list name"),
+      reminder_name: z.string().max(1000).describe("Name of the reminder to complete"),
     },
     annotations: {
       readOnlyHint: false,
@@ -385,8 +388,8 @@ Args:
 Returns:
   { success: boolean, deleted: string }`,
     inputSchema: {
-      list_name: z.string().describe("Reminder list name"),
-      reminder_name: z.string().describe("Name of the reminder to delete"),
+      list_name: z.string().max(500).describe("Reminder list name"),
+      reminder_name: z.string().max(1000).describe("Name of the reminder to delete"),
     },
     annotations: {
       readOnlyHint: false,
@@ -469,7 +472,7 @@ Args:
 Returns:
   Array of { name, list_name, id, completed, due_date }`,
     inputSchema: {
-      query: z.string().min(1).describe("Search keyword"),
+      query: z.string().min(1).max(1000).describe("Search keyword"),
       include_completed: z
         .boolean()
         .default(false)
@@ -545,7 +548,40 @@ async function main(): Promise<void> {
 
   if (mode === "http") {
     const app = express();
+
+    // Bearer token auth — use MCP_AUTH_TOKEN env var or generate one at startup
+    const token = process.env.MCP_AUTH_TOKEN || crypto.randomBytes(32).toString("hex");
+
+    // CORS — only allow explicit origins via MCP_CORS_ORIGIN env var
+    const allowedOrigin = process.env.MCP_CORS_ORIGIN ?? "";
+    app.use((_req, res, next) => {
+      if (allowedOrigin) {
+        res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+        res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      }
+      // Block cross-origin requests when no origin is configured
+      if (!allowedOrigin) {
+        res.setHeader("Access-Control-Allow-Origin", "null");
+      }
+      if (_req.method === "OPTIONS") {
+        res.status(204).end();
+        return;
+      }
+      next();
+    });
+
     app.use(express.json());
+
+    // Auth middleware for /mcp
+    app.use("/mcp", (req, res, next) => {
+      const auth = req.headers.authorization;
+      if (!auth || auth !== `Bearer ${token}`) {
+        res.status(401).json({ error: "Unauthorized — provide Authorization: Bearer <token>" });
+        return;
+      }
+      next();
+    });
 
     app.post("/mcp", async (req, res) => {
       const transport = new StreamableHTTPServerTransport({
@@ -560,6 +596,7 @@ async function main(): Promise<void> {
     const port = parseInt(process.env.PORT ?? "9820");
     app.listen(port, "127.0.0.1", () => {
       console.error(`reminders-mcp-server HTTP on :${port}/mcp`);
+      console.error(`Auth token: ${token}`);
     });
   } else {
     const transport = new StdioServerTransport();
